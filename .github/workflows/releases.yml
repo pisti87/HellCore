@@ -1,0 +1,384 @@
+
+name: Heltec Release
+
+# Heltec V3 / T114 / T096 Companion firmware build
+# ESP32: BIN + MERGED BIN
+# nRF52: eredeti PlatformIO ZIP + UF2 (ha rendelkezésre áll)
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Verzió (pl. v1.2.0)'
+        required: true
+        type: string
+
+      prerelease:
+        description: 'Előzetes kiadás'
+        required: false
+        default: false
+        type: boolean
+
+      draft:
+        description: 'Piszkozat (draft)'
+        required: false
+        default: false
+        type: boolean
+
+      disable_debug:
+        description: 'Debug naplózás kikapcsolása'
+        required: false
+        default: true
+        type: boolean
+
+  push:
+    tags:
+      - 'heltec-v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: heltec-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+
+  # --------------------------------------------------
+  # VERSION
+  # --------------------------------------------------
+
+  prepare:
+    name: Verzió meghatározása
+    runs-on: ubuntu-latest
+
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      tag: ${{ steps.v.outputs.tag }}
+
+    steps:
+      - name: Verzió és tag meghatározása
+        id: v
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${GITHUB_REF}" == refs/tags/heltec-* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+            VERSION="${TAG#heltec-}"
+          else
+            VERSION="${INPUT_VERSION}"
+            VERSION="${VERSION#heltec-}"
+            TAG="heltec-${VERSION}"
+          fi
+
+          if [[ ! "${VERSION}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "Érvénytelen verzió: ${VERSION}"
+            exit 1
+          fi
+
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+          echo "Verzió: ${VERSION}"
+          echo "Tag: ${TAG}"
+
+  # --------------------------------------------------
+  # BUILD
+  # --------------------------------------------------
+
+  build:
+    name: Build ${{ matrix.target }}
+
+    needs: prepare
+
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+
+      matrix:
+        target:
+          - Heltec_v3_companion_radio_ble
+          - Heltec_v3_companion_radio_usb
+          - Heltec_v3_companion_radio_wifi
+          - Heltec_t114_companion_radio_ble
+          - Heltec_t114_companion_radio_usb
+          - Heltec_t096_companion_radio_ble
+          - Heltec_t096_companion_radio_usb
+
+    steps:
+
+      - name: Repository checkout
+        uses: actions/checkout@v4
+
+        with:
+          fetch-depth: 0
+
+      - name: Python telepítése
+        uses: actions/setup-python@v5
+
+        with:
+          python-version: '3.11'
+
+      - name: PlatformIO gyorsítótár
+        uses: actions/cache@v4
+
+        with:
+          path: |
+            ~/.cache/pip
+            ~/.platformio/.cache
+
+          key: ${{ runner.os }}-pio-${{ hashFiles('platformio.ini', 'variants/**/platformio.ini') }}
+
+          restore-keys: |
+            ${{ runner.os }}-pio-
+
+      - name: PlatformIO telepítése
+        run: |
+          python -m pip install --upgrade pip
+          pip install platformio
+
+      # ----------------------------------------------
+      # FIRMWARE BUILD
+      # ----------------------------------------------
+
+      - name: Firmware fordítása és csomagolása
+        shell: bash
+
+        env:
+          TARGET: ${{ matrix.target }}
+          FIRMWARE_VERSION: ${{ needs.prepare.outputs.version }}
+          DISABLE_DEBUG: ${{ github.event.inputs.disable_debug != 'false' && '1' || '0' }}
+
+        run: |
+          set -euo pipefail
+
+          mkdir -p out
+
+          BUILD_DIR=".pio/build/${TARGET}"
+
+          echo "======================================"
+          echo "Firmware: ${TARGET}"
+          echo "Verzió: ${FIRMWARE_VERSION}"
+          echo "Debug kikapcsolva: ${DISABLE_DEBUG}"
+          echo "======================================"
+
+          # ------------------------------------------
+          # ESP32 - Heltec V3
+          # ------------------------------------------
+
+          if [[ "${TARGET}" == Heltec_v3_* ]]; then
+
+            echo "ESP32 firmware fordítása"
+
+            bash build.sh build-firmware "${TARGET}"
+
+            # A build.sh az out könyvtárba készíti
+            # a platformhoz tartozó firmware fájlokat.
+
+            if [[ -z "$(find out -maxdepth 1 -type f -print -quit)" ]]; then
+              echo "HIBA: Nem készült ESP32 firmware!"
+              exit 1
+            fi
+
+          # ------------------------------------------
+          # nRF52 - Heltec T096 / T114
+          # ------------------------------------------
+
+          elif [[ "${TARGET}" == Heltec_t096_* || "${TARGET}" == Heltec_t114_* ]]; then
+
+            echo "nRF52 firmware fordítása közvetlenül PlatformIO-val"
+
+            # Pontosan ugyanaz az eljárás, mint a
+            # működő T096 BLE workflow-ban.
+
+            pio run -e "${TARGET}"
+
+            # A PlatformIO eredeti DFU ZIP fájlja kötelező.
+
+            if [[ ! -f "${BUILD_DIR}/firmware.zip" ]]; then
+              echo "HIBA: Nem készült firmware.zip!"
+              echo "Build könyvtár tartalma:"
+              ls -lah "${BUILD_DIR}/" || true
+              exit 1
+            fi
+
+            cp "${BUILD_DIR}/firmware.zip" \
+              "out/${TARGET}.zip"
+
+            # Az UF2-t is átvesszük, ha a build elkészítette.
+
+            if [[ -f "${BUILD_DIR}/firmware.uf2" ]]; then
+              cp "${BUILD_DIR}/firmware.uf2" \
+                "out/${TARGET}.uf2"
+            else
+              echo "FIGYELEM: firmware.uf2 nem található."
+            fi
+
+          else
+
+            echo "HIBA: Ismeretlen build cél: ${TARGET}"
+            exit 1
+
+          fi
+
+          # ------------------------------------------
+          # OUTPUT CHECK
+          # ------------------------------------------
+
+          echo ""
+          echo "Elkészült firmware fájlok:"
+          ls -lh out/
+
+          if [[ -z "$(find out -maxdepth 1 -type f -print -quit)" ]]; then
+            echo "HIBA: Üres kimeneti könyvtár!"
+            exit 1
+          fi
+
+          # nRF52 esetén a ZIP megléte kötelező.
+
+          if [[ "${TARGET}" == Heltec_t096_* || "${TARGET}" == Heltec_t114_* ]]; then
+            test -s "out/${TARGET}.zip"
+          fi
+
+          echo "Firmware build sikeres: ${TARGET}"
+
+      # ----------------------------------------------
+      # ARTIFACT
+      # ----------------------------------------------
+
+      - name: Artifact feltöltése
+        uses: actions/upload-artifact@v4
+
+        with:
+          name: ${{ matrix.target }}
+          path: out/
+          if-no-files-found: error
+          retention-days: 14
+
+  # --------------------------------------------------
+  # RELEASE
+  # --------------------------------------------------
+
+  release:
+    name: GitHub Release készítése
+
+    needs:
+      - prepare
+      - build
+
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Repository checkout
+        uses: actions/checkout@v4
+
+      - name: Artifactok letöltése
+        uses: actions/download-artifact@v4
+
+        with:
+          path: dist
+          merge-multiple: true
+
+      # ----------------------------------------------
+      # CHECKSUMS
+      # ----------------------------------------------
+
+      - name: Firmware fájlok ellenőrzése
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Release fájlok:"
+
+          find dist -maxdepth 1 -type f -print
+
+          if [[ -z "$(find dist -maxdepth 1 -type f -print -quit)" ]]; then
+            echo "HIBA: Nincs Release fájl!"
+            exit 1
+          fi
+
+          # Minden firmware SHA256 ellenőrző összege.
+
+          cd dist
+
+          sha256sum * > SHA256SUMS.txt
+
+          echo ""
+          cat SHA256SUMS.txt
+
+      # ----------------------------------------------
+      # RELEASE NOTES
+      # ----------------------------------------------
+
+      - name: Release leírás készítése
+        shell: bash
+
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+
+        run: |
+          cat > RELEASE_NOTES.md <<NOTES
+          # Heltec Companion ${VERSION}
+
+          Heltec Companion firmware kiadás.
+
+          ## Támogatott eszközök
+
+          - Heltec V3 (ESP32-S3)
+          - Heltec T114 (nRF52)
+          - Heltec T096 (nRF52)
+
+          ## Firmware letöltése
+
+          | Eszköz | Firmware | Felhasználás |
+          |---|---|---|
+          | Heltec V3 | \`*-merged.bin\` | Első telepítés |
+          | Heltec V3 | \`*.bin\` | Firmware frissítés |
+          | Heltec T114 | \`*.zip\` | DFU firmware |
+          | Heltec T114 | \`*.uf2\` | USB meghajtós telepítés |
+          | Heltec T096 | \`*.zip\` | DFU firmware |
+          | Heltec T096 | \`*.uf2\` | USB meghajtós telepítés |
+
+          ## Kapcsolattípusok
+
+          - BLE: Bluetooth
+          - USB: USB kapcsolat
+          - WiFi: WiFi kapcsolat
+
+          ## Ellenőrzés
+
+          A SHA256SUMS.txt fájl tartalmazza a firmware-ek
+          SHA256 ellenőrző összegeit.
+          NOTES
+
+      # ----------------------------------------------
+      # CREATE RELEASE
+      # ----------------------------------------------
+
+      - name: GitHub Release létrehozása
+        uses: softprops/action-gh-release@v2
+
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+
+          target_commitish: ${{ github.sha }}
+
+          name: Heltec Companion ${{ needs.prepare.outputs.version }}
+
+          body_path: RELEASE_NOTES.md
+
+          draft: ${{ github.event.inputs.draft == 'true' }}
+
+          prerelease: ${{ github.event.inputs.prerelease == 'true' }}
+
+          fail_on_unmatched_files: true
+
+          files: dist/*
+
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
